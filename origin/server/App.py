@@ -1,0 +1,219 @@
+# coding=utf-8
+
+import ssl
+import json
+
+from html import escape as html_escape
+from urllib.parse import parse_qs
+
+from wsgiref.simple_server import make_server
+
+from origin.server.Session import Session
+from origin.common.errors.SessionClose import SessionClose
+from origin.server.SessionFactory import SessionFactory
+from origin.server.AsyncWsgiServer import AsyncWsgiServer
+from origin.server.NoLoggingRequestHandler import NoLoggingRequestHandler
+
+
+#
+# WSGI implementation of game support for HTTP connections.
+# See: http://wsgi.readthedocs.io/en/latest/
+#
+class App(object):
+
+    def __init__(self, engine):
+        self.engine = engine
+
+    #
+    # Fires whenever an instance of the class is called allowing for the form below by implementing
+    # the __call__ method thus making the class a "callable"
+    #
+    # a = App()
+    # b = a()
+    #
+    # See: http://eli.thegreenplace.net/2012/03/23/python-internals-how-callables-work/
+    #
+    def __call__(self, environ, start_response):
+
+        method = environ.get("REQUEST_METHOD")
+        path = environ.get('PATH_INFO', '').lstrip('/')
+
+        #
+        # The POST method indicates we have input we need to process. Very simple routing.
+        #
+        if method == "POST":
+
+            clength = int(environ["CONTENT_LENGTH"])
+
+            if clength > int(1e6):
+                raise ValueError("Maximum content length of 1M exceeded.")
+
+            inputstream = environ['wsgi.input']
+            qs = inputstream.read(clength)
+            qs = qs.decode("utf-8")
+            parameters = self.delist_parameters(parse_qs(qs, encoding="UTF-8"))
+
+            return self._input(environ, parameters, start_response)
+
+        #
+        # The GET method indicates we're being polled for any output waiting to be processed. Very simple routing.
+        #
+        elif method == "GET":
+
+            qs = environ.get("QUERY_STRING", "")
+            parameters = self.delist_parameters(parse_qs(qs, encoding="UTF-8"))
+
+            return self._output(environ, parameters, start_response)
+
+        #
+        # We support no other HTTP requests. Keep it simple!
+        #
+        else:
+            return self.invalid_request_405(start_response)
+
+        pass
+
+    #
+    # Process user input as provided by any HTTP POST event. Player must be logged in or error 500 is returned.
+    #
+    def _input(self, environ, parameters, start_response):
+
+        session = environ["wsgi.session"]
+        conn = session.get("player_connection")
+
+        if not conn:
+            return self.internal_server_error_500(start_response, "not logged in")
+
+        # Get the action the user wants to perform. If the user is logging in this will contain the
+        # username and password provided so 'action' is a bit of a misnomer is some edge cases.
+        action = parameters.get("input", "")
+        action = html_escape(action, False)
+
+        if action:
+
+            # Allows us to support the 'input-noecho' input form and refrain from sending passwords
+            # back to the browser.
+            if conn.io.dont_echo_next:
+                conn.io.dont_echo_next = False
+
+            # We always echo the user's input back to their client wrapped with tags the client can
+            # use to determine who best to handle user input history. The exception is when the input-noecho
+            # form is used to mask passwords.
+            else:
+                conn.io.html_to_browser.append("<userinput>%s</userinput>" % action)
+
+            # Save the input to the player object associated with the connection
+            conn.player.store_input_line(action)
+
+        start_response('200 OK', [('Content-Type', 'text/plain')])
+        return []
+
+    #
+    # Process user output as provided by any HTTP GET event. Player must be logged in or error 500 is returned.
+    #
+    def _output(self, environ, parameters, start_response):
+
+        session = environ["wsgi.session"]
+
+        # Is this a new player session? If so store a new PlayerConnection object in the session via the
+        # Session session manager class.
+        if "player_connection" not in session:
+
+            print("Creating new player session")
+
+            # If so, create a ne PlayerConnection instance
+            # and store it in the session's list.
+            conn = self.engine._connect()
+            session["player_connection"] = conn
+
+        # If not we're dealing with a request from a returning player
+        else:
+            conn = session.get("player_connection")
+
+        # Insure the user is logged in.
+        if not conn:
+            return self.internal_server_error_500(start_response, "not logged in")
+
+        # If any resources associated with the connection aren't available
+        if not conn or not conn.player or not conn.io:
+            raise SessionClose("{\"Notice\": \"This connection is no longer valid. Please try again.\"}", "application/json")
+
+        html, conn.io.html_to_browser = conn.io.html_to_browser, []
+        oob, conn.io.out_of_band = conn.io.out_of_band, []
+
+        start_response('200 OK', [('Content-Type', 'application/json; charset=utf-8'),
+                                  ('Cache-Control', 'no-cache, no-store, must-revalidate'),
+                                  ('Pragma', 'no-cache'),
+                                  ('Expires', '0')])
+
+        response = {"text": "\n".join(html)}
+
+        # NOTE: This would be one way to handle sending state values that could be optionally
+        # processed by the client in some particularly nice way. For example:
+        #
+        # response["location"] = conn.player.location.title
+        #
+
+        # Send any custom out of band information to the client.
+        if html and conn.player:
+            response["oob"] = oob
+
+        return [json.dumps(response).encode("utf-8")]
+
+    #
+    #   Create a very simple WSGI server implementation and return it to the caller
+    #
+    @classmethod
+    def create_server(cls, engine):
+
+        wsgi_app = Session(cls(engine), SessionFactory())
+        wsgi_server = make_server(engine.config.host, engine.config.port, app=wsgi_app,
+                                  handler_class=NoLoggingRequestHandler, server_class=AsyncWsgiServer)
+
+        # Experimental SSL support
+        if engine.config.ssl and engine.config.host != "localhost":
+
+            certfile = "/etc/certbot/live/host.domain.com/cert.pem"
+            keyfile = "/etc/certbot/live/host.domain.com/privkey.pem"
+            ca_certs = "/etc/certbot/live/host.domain.com/fullchain.pem"
+
+            wsgi_server.socket = ssl.wrap_socket(
+                wsgi_server.socket,
+                certfile=certfile,  # path to certificate
+                keyfile=keyfile,
+                ca_certs=ca_certs,
+                server_side=True)
+
+        return wsgi_server
+
+    #
+    # Super basic implementations of a few HTTP response codes we might need
+    #
+
+    def not_found_404(self, start_response):
+        start_response('404 Not Found', [('Content-Type', 'text/plain')])
+        return [b'Error 404: Not Found']
+
+    def invalid_request_405(self, start_response):
+        start_response('405 Method Not Allowed', [('Content-Type', 'text/plain')])
+        return [b'Error 405: Method Not Allowed']
+
+    def redirect_302(self, start_response, target):
+        start_response('302 Found', [('Location', target)])
+        return []
+
+    def internal_server_error_500(self, start_response, message=""):
+        start_response('500 Internal server error', [])
+        return [message.encode("utf-8")]
+
+    #
+    # Converts a parameter dictionary with values expressed as a list containing
+    # one value to a dictionary holding only the unitary value
+    #
+    def delist_parameters(self, parameters):
+
+        for key, value in parameters.items():
+            if isinstance(value, (list, tuple)) and len(value) == 1:
+                parameters[key] = value[0]
+
+        return parameters
